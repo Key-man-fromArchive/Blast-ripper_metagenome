@@ -25,6 +25,7 @@ import time
 import networkx as nx
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
+import plotly.express as px
 
 def setup_logging(output_dir):
     """Set up logging configuration with rotation"""
@@ -118,11 +119,11 @@ def run_blast(chunk, blast_db, out_file, use_ramdisk, num_threads, taxids, logge
             f"{taxid_option} -out {temp_out}")
         
         try:
-            result = subprocess.run(shlex.split(cmd), check=True, capture_output=True, text=True, timeout=3600)
+            result = subprocess.run(shlex.split(cmd), check=True, capture_output=True, text=True, timeout=36000)
             if "The -taxids command line option requires additional data files" in result.stderr:
                 logger.warning("Taxid filtering is not available. Running BLAST without taxid filter.")
                 cmd_without_taxid = cmd.replace(taxid_option, "")
-                subprocess.run(shlex.split(cmd_without_taxid), check=True, timeout=3600)
+                subprocess.run(shlex.split(cmd_without_taxid), check=True, timeout=36000)
         except subprocess.TimeoutExpired:
             logger.error(f"BLAST process timed out for chunk: {chunk}")
             return None
@@ -150,20 +151,16 @@ def parse_local_taxonomy(taxdb_dir, logger):
         
         try:
             with open(names_file, 'r') as f:
-                for line_num, line in enumerate(tqdm(f, desc="Parsing names.dmp"), 1):
-                    fields = line.split('|')
-                    if len(fields) > 3 and fields[3].strip() == "scientific name":
-                        taxid = fields[0].strip()
-                        name = fields[1].strip()
+                for line in tqdm(f, desc="Parsing names.dmp"):
+                    fields = line.strip().split('|')
+                    taxid = fields[0].strip()
+                    name = fields[1].strip()
+                    name_class = fields[3].strip()
+                    if name_class == 'scientific name':
                         scientific_names[taxid] = name
-                    
-                    if line_num % 100000 == 0:
-                        logger.debug(f"Processed {line_num} lines from names.dmp")
         except Exception as e:
             logger.error(f"Error parsing names.dmp: {str(e)}")
             raise
-
-        logger.info(f"Total scientific names parsed: {len(scientific_names)}")
 
         # Parse nodes.dmp
         nodes_file = os.path.join(taxdb_dir, 'nodes.dmp')
@@ -171,42 +168,33 @@ def parse_local_taxonomy(taxdb_dir, logger):
         
         try:
             with open(nodes_file, 'r') as f:
-                for line_num, line in enumerate(tqdm(f, desc="Parsing nodes.dmp"), 1):
-                    fields = line.split('|')
-                    if len(fields) > 2:
-                        taxid = fields[0].strip()
-                        parent_taxid = fields[1].strip()
-                        rank = fields[2].strip()
-                        
-                        if taxid in scientific_names:
-                            name = scientific_names[taxid]
-                            taxonomy_dict[taxid] = {
-                                'name': name,
-                                'rank': rank,
-                                'parent_taxid': parent_taxid,
-                                'lineage': {}
-                            }
+                for line in tqdm(f, desc="Parsing nodes.dmp"):
+                    fields = line.strip().split('|')
+                    taxid = fields[0].strip()
+                    parent_taxid = fields[1].strip()
+                    rank = fields[2].strip()
                     
-                    if line_num % 100000 == 0:
-                        logger.debug(f"Processed {line_num} lines from nodes.dmp")
+                    name = scientific_names.get(taxid, 'Unknown')
+                    taxonomy_dict[taxid] = {
+                        'name': name,
+                        'rank': rank,
+                        'parent_taxid': parent_taxid,
+                        'lineage': {}
+                    }
 
             # Build lineage information
             logger.info("Building lineage information...")
             for taxid in tqdm(taxonomy_dict.keys(), desc="Building lineages"):
                 current_taxid = taxid
-                visited = set()  # Prevent infinite loops
-                
-                while current_taxid != '1' and current_taxid in taxonomy_dict and current_taxid not in visited:
-                    visited.add(current_taxid)
-                    parent_taxid = taxonomy_dict[current_taxid]['parent_taxid']
-                    parent_info = taxonomy_dict.get(parent_taxid, {})
-                    parent_rank = parent_info.get('rank', '')
-                    parent_name = parent_info.get('name', '')
-
-                    if parent_rank in ['species', 'genus', 'family', 'order']:
-                        taxonomy_dict[taxid]['lineage'][parent_rank] = parent_name
-
-                    current_taxid = parent_taxid
+                lineage = {}
+                while current_taxid != '1' and current_taxid in taxonomy_dict:
+                    parent_info = taxonomy_dict.get(current_taxid)
+                    rank = parent_info.get('rank', '')
+                    name = parent_info.get('name', '')
+                    if rank:
+                        lineage[rank] = name
+                    current_taxid = parent_info.get('parent_taxid', '1')
+                taxonomy_dict[taxid]['lineage'] = lineage
 
         except Exception as e:
             logger.error(f"Error parsing nodes.dmp: {str(e)}")
@@ -329,21 +317,37 @@ class TaxonomyAnalyzer:
         self.rank_order = ['superkingdom', 'phylum', 'class', 'order', 'family', 'genus', 'species']
         
     def build_lineage_tree(self, taxids):
-        """Build a hierarchical tree structure from taxonomy data"""
+        """Build a hierarchical tree structure from taxonomy data with improved error handling"""
         with PerformanceMonitor(self.logger):
-            tree = defaultdict(lambda: defaultdict(int))
+            tree = {}
             
+            if not taxids:
+                self.logger.warning("No taxids provided for tree building")
+                return tree
+                
             for taxid in tqdm(taxids, desc="Building lineage tree"):
                 if taxid in self.taxonomy_dict:
                     info = self.taxonomy_dict[taxid]
                     lineage = info.get('lineage', {})
                     
-                    current_path = []
-                    for rank in self.rank_order:
-                        if rank in lineage:
-                            current_path.append(lineage[rank])
-                            tree[rank][tuple(current_path)] += 1
+                    current_level = tree
+                    # Ensure that the lineage is sorted by rank order
+                    lineage_sorted = [lineage[rank] for rank in self.rank_order if rank in lineage]
+                    
+                    if not lineage_sorted:
+                        self.logger.debug(f"No valid lineage found for taxid: {taxid}")
+                        continue
+                        
+                    for name in lineage_sorted:
+                        current_level = current_level.setdefault(name, {})
+                    # Increment count at the leaf node
+                    current_level['count'] = current_level.get('count', 0) + 1
+                else:
+                    self.logger.debug(f"Taxid not found in taxonomy dictionary: {taxid}")
             
+            if not tree:
+                self.logger.warning("No valid taxonomy tree could be built")
+                
             return tree
     
     def calculate_diversity_metrics(self, taxids):
@@ -384,6 +388,29 @@ class TaxonomyAnalyzer:
             }
             
             return metrics
+        
+    def get_max_depth(self, tree):
+        """Calculate the maximum depth of the taxonomy tree with empty tree handling."""
+        def depth(node, current_depth):
+            if not isinstance(node, dict) or 'count' in node:
+                return current_depth
+            if not node:  # Empty dictionary
+                return current_depth
+            try:
+                return max(depth(child, current_depth + 1) for child in node.values())
+            except ValueError:  # Handle empty iteration
+                return current_depth
+
+        try:
+            if not tree:  # Empty tree
+                self.logger.warning("Empty taxonomy tree detected. Setting depth to 0.")
+                return 0
+            max_depth = depth(tree, 0)
+            self.logger.info(f"Maximum taxonomy tree depth: {max_depth}")
+            return max_depth
+        except Exception as e:
+            self.logger.error(f"Error calculating tree depth: {str(e)}")
+            return 0    
 
 def parse_blast_results(blast_output, qcov_threshold, logger):
     """Parse BLAST results with improved error handling and monitoring"""
@@ -418,25 +445,30 @@ def parse_blast_results(blast_output, qcov_threshold, logger):
         raise
 
 def chunk_file(file_path, num_chunks, logger):
-    """Split input file into chunks with improved monitoring"""
+    """Split input file into chunks without loading all records into memory"""
     logger.info(f"Splitting input file '{file_path}' into {num_chunks} chunks")
     
     try:
-        records = list(SeqIO.parse(file_path, "fasta"))
-        total_records = len(records)
+        record_iter = SeqIO.parse(file_path, "fasta")
+        total_records = sum(1 for _ in record_iter)
+        record_iter = SeqIO.parse(file_path, "fasta")  # Reset iterator
         chunk_size = total_records // num_chunks
         chunks = []
         
         for i in range(num_chunks):
-            start = i * chunk_size
-            end = (i + 1) * chunk_size if i != num_chunks - 1 else total_records
-            
             with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix='.fasta') as chunk_file:
-                SeqIO.write(records[start:end], chunk_file.name, "fasta")
+                count = 0
+                while count < chunk_size:
+                    try:
+                        record = next(record_iter)
+                        SeqIO.write(record, chunk_file, "fasta")
+                        count += 1
+                    except StopIteration:
+                        break
                 chunks.append(chunk_file.name)
                 logger.debug(f"Created chunk {i+1}/{num_chunks}: {chunk_file.name}")
         
-        logger.info(f"Successfully split file into {num_chunks} chunks")
+        logger.info(f"Successfully split file into {len(chunks)} chunks")
         return chunks
     except Exception as e:
         logger.error(f"Error splitting file: {str(e)}")
@@ -446,7 +478,6 @@ class TaxonomyVisualizer:
     def __init__(self, figsize=(12, 8), logger=None):
         self.figsize = figsize
         self.logger = logger
-        import seaborn as sns  # Ensure seaborn is imported
         sns.set_style('darkgrid')  # Set seaborn style directly
 
     def plot_all_distributions(self, parsed_data, output_dir):
@@ -458,52 +489,68 @@ class TaxonomyVisualizer:
             self.plot_network_diagram(parsed_data, output_dir)
             self.plot_diversity_metrics(parsed_data, output_dir)
 
-    def plot_hierarchical_sunburst(self, tree_data):
-        """Create a hierarchical sunburst plot with improved design"""
-        plt.figure(figsize=(12, 12))
-        
-        def plot_level(data, start_angle=0, radius=1, level=0):
-            total = sum(data.values())
-            current_angle = start_angle
-            
-            for key, value in data.items():
-                angle = 2 * np.pi * value / total
-                
-                # Plot sector
-                angles = np.linspace(current_angle, current_angle + angle, 50)
-                radii = np.linspace(radius, radius + 0.8, 50)
-                r, theta = np.meshgrid(radii, angles)
-                
-                color = plt.cm.viridis(level / 5)  # Color based on level
-                plt.pcolormesh(theta, r, np.ones_like(r), color=color, alpha=0.7)
-                
-                # Add labels for significant segments
-                if value / total > 0.05:  # Label only segments > 5%
-                    mid_angle = current_angle + angle/2
-                    mid_radius = radius + 0.4
-                    x = mid_radius * np.cos(mid_angle)
-                    y = mid_radius * np.sin(mid_angle)
-                    
-                    label = str(key)
-                    if len(label) > 20:
-                        label = label[:17] + "..."
-                    
-                    rotation = np.degrees(mid_angle)
-                    if rotation > 90 and rotation < 270:
-                        rotation += 180
-                    
-                    plt.text(x, y, label, ha='center', va='center', rotation=rotation)
-                
-                if isinstance(value, dict):
-                    plot_level(value, current_angle, radius + 1, level + 1)
-                
-                current_angle += angle
-        
-        # Call the plotting function
-        plot_level(tree_data)
-        plt.title("Taxonomic Distribution (Sunburst)")
-        plt.axis('equal')
-        return plt.gcf()
+    def plot_hierarchical_sunburst(self, tree_data, output_path, max_level=None):
+        """Create a hierarchical sunburst plot using Plotly up to a specified taxonomy level."""
+        import plotly.express as px
+
+        # Flatten the tree into a dataframe
+        data = []
+
+        def traverse_tree(data_dict, path=[], level=0):
+            for key, value in data_dict.items():
+                if key == 'count':
+                    continue
+                current_path = path + [key]
+                if 'count' in value:
+                    count = value['count']
+                    data.append({'path': current_path, 'count': count})
+                # Only traverse deeper if max_level is not set or current level is less than max_level - 1
+                if max_level is None or level < max_level - 1:
+                    traverse_tree(value, current_path, level + 1)
+
+        traverse_tree(tree_data)
+
+        if not data:
+            self.logger.warning("No data available for sunburst plot.")
+            return
+
+        # Prepare the dataframe
+        df = pd.DataFrame(data)
+        levels = list(zip(*df['path']))
+        df_levels = pd.DataFrame(levels).T
+        df_levels.columns = [f'level_{i}' for i in range(len(df_levels.columns))]
+        df = pd.concat([df, df_levels], axis=1)
+
+        # Determine the number of levels in the data
+        num_levels_in_data = len(df_levels.columns)
+
+        # Adjust the path to include only up to max_level or the maximum level in the data
+        if max_level is not None:
+            actual_max_level = min(max_level, num_levels_in_data)
+        else:
+            actual_max_level = num_levels_in_data
+
+        # Prepare path columns
+        path_columns = [f'level_{i}' for i in range(actual_max_level)]
+
+        # Check if we have at least one level to plot
+        if not path_columns:
+            self.logger.warning("Insufficient data levels for sunburst plot.")
+            return
+
+        # Create sunburst plot
+        fig = px.sunburst(
+            df,
+            path=path_columns,
+            values='count',
+            color='count',
+            color_continuous_scale='Viridis'
+        )
+        fig.update_layout(margin=dict(t=0, l=0, r=0, b=0))
+
+        # Save the figure
+        fig.write_image(output_path)
+        self.logger.info(f"Sunburst plot saved at {output_path}")
 
     def plot_diversity_heatmap(self, metrics_by_sample):
         """Create an enhanced heatmap of diversity metrics"""
@@ -620,8 +667,50 @@ class TaxonomyVisualizer:
     def plot_rank_distributions(self, parsed_data, output_dir):
         """Plot distribution for each taxonomic rank"""
         ranks = ['species', 'genus', 'family']
-        
+
         for rank in ranks:
+            if rank not in parsed_data or not parsed_data[rank]:
+                self.logger.warning(f"No data for {rank}. Skipping plot.")
+                continue
+
+            data = Counter(parsed_data[rank])
+            top_10 = dict(sorted(data.items(), key=lambda x: x[1], reverse=True)[:10])
+
+            # Bar plot
+            plt.figure(figsize=self.figsize)
+            bars = plt.bar(top_10.keys(), top_10.values())
+            plt.title(f'Top 10 {rank.capitalize()} Distribution')
+            plt.xlabel(rank.capitalize())
+            plt.ylabel('Count')
+            plt.xticks(rotation=45, ha='right')
+
+            for bar in bars:
+                height = bar.get_height()
+                plt.text(bar.get_x() + bar.get_width()/2., height,
+                        f'{height}',
+                        ha='center', va='bottom')
+
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, f'{rank}_distribution_bar.png'))
+            plt.close()
+
+            # Pie chart with legend
+            plt.figure(figsize=(10, 10))
+            labels = [label[:20] + '...' if len(label) > 20 else label for label in top_10.keys()]
+            patches, texts, autotexts = plt.pie(
+                top_10.values(),
+                labels=None,  # Remove labels from slices
+                autopct='%1.1f%%',
+                startangle=90,
+                textprops={'fontsize': 8}
+            )
+            plt.legend(patches, labels, loc='best', fontsize=8)
+            plt.axis('equal')
+            plt.title(f'Top 10 {rank.capitalize()} Distribution')
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, f'{rank}_distribution_pie.png'))
+            plt.close()
+
             if rank not in parsed_data or not parsed_data[rank]:
                 self.logger.warning(f"No data for {rank}. Skipping plot.")
                 continue
@@ -691,37 +780,94 @@ def plot_taxonomy(parsed_data, output_dir):
     visualizer.logger = logger
     visualizer.plot_all_distributions(parsed_data, output_dir)
 
-def save_all_visualizations(analyzer, visualizer, taxids, output_dir, logger):
-    """Generate and save all visualizations"""
+def save_all_visualizations(analyzer, visualizer, matched_sequences_all, output_dir, logger):
+    """Generate and save all visualizations with improved error handling"""
     with PerformanceMonitor(logger):
         logger.info("Generating visualizations")
-        
+
+        # Collect all taxids with validation
+        all_taxids = set()
+        if not matched_sequences_all:
+            logger.warning("No matched sequences found")
+            return {"error": "No matched sequences", "total_sequences": 0}
+
+        for matches in matched_sequences_all.values():
+            for match in matches:
+                taxid = match[2]
+                if taxid in analyzer.taxonomy_dict:  # Only add valid taxids
+                    all_taxids.add(taxid)
+
+        if not all_taxids:
+            logger.warning("No valid taxids found in matched sequences")
+            return {"error": "No valid taxonomy data", "total_sequences": len(matched_sequences_all)}
+
         # Build tree and calculate metrics
-        tree = analyzer.build_lineage_tree(taxids)
-        metrics = analyzer.calculate_diversity_metrics(taxids)
+        logger.info(f"Building lineage tree for {len(all_taxids)} taxids")
+        tree = analyzer.build_lineage_tree(all_taxids)
         
+        logger.info("Calculating diversity metrics")
+        metrics = analyzer.calculate_diversity_metrics(all_taxids)
+
+        if not tree:
+            logger.warning("Empty taxonomy tree generated")
+            return metrics or {"error": "Empty taxonomy tree", "total_sequences": len(matched_sequences_all)}
+
         # Create visualization directory
         vis_dir = os.path.join(output_dir, 'visualizations')
         os.makedirs(vis_dir, exist_ok=True)
-        
-        # Generate and save plots
-        visualizer.plot_hierarchical_sunburst(tree).savefig(
-            os.path.join(vis_dir, 'sunburst_plot.png'))
-        
-        visualizer.plot_diversity_heatmap({'Sample': metrics}).savefig(
-            os.path.join(vis_dir, 'diversity_heatmap.png'))
-        
-        # For plot_network_diagram, we need to prepare parsed_data
-        parsed_data = {'tree': tree}
-        visualizer.plot_network_diagram(parsed_data, vis_dir)
-        
-        # Save metrics as JSON
-        metrics_file = os.path.join(output_dir, 'diversity_metrics.json')
-        with open(metrics_file, 'w') as f:
-            json.dump(metrics, f, indent=2)
-        
-        logger.info("Visualization generation complete")
-        return metrics
+
+        # Prepare parsed_data
+        parsed_data = {'species': defaultdict(int), 'genus': defaultdict(int), 'family': defaultdict(int)}
+        for matches in matched_sequences_all.values():
+            for match in matches:
+                taxid = match[2]
+                if taxid in analyzer.taxonomy_dict:  # Only process valid taxids
+                    taxonomy = get_taxonomy_info(taxid, analyzer.taxonomy_dict)
+                    if taxonomy['species'] != 'N/A':
+                        parsed_data['species'][taxonomy['species']] += 1
+                    if taxonomy['genus'] != 'N/A':
+                        parsed_data['genus'][taxonomy['genus']] += 1
+                    if taxonomy['family'] != 'N/A':
+                        parsed_data['family'][taxonomy['family']] += 1
+
+        try:
+            # Determine the maximum depth of your data
+            max_depth = analyzer.get_max_depth(tree)
+            if max_depth == 0:
+                logger.warning("Tree depth is 0, skipping sunburst plots")
+            else:
+                # Map level numbers to taxonomic ranks
+                rank_order = analyzer.rank_order
+                level_names = {}
+                for i in range(1, max_depth + 1):
+                    if i <= len(rank_order):
+                        level_names[i] = rank_order[i - 1]
+
+                # Generate sunburst plots only if we have valid levels
+                if level_names:
+                    for max_level, level_name in level_names.items():
+                        sunburst_output_path = os.path.join(vis_dir, f'sunburst_plot_{level_name}.png')
+                        visualizer.plot_hierarchical_sunburst(tree, sunburst_output_path, max_level=max_level)
+                        logger.info(f"Sunburst plot up to {level_name} level saved")
+
+            # Generate other plots if we have parsed data
+            if any(parsed_data.values()):
+                visualizer.plot_diversity_heatmap({'Sample': metrics}).savefig(
+                    os.path.join(vis_dir, 'diversity_heatmap.png'))
+                visualizer.plot_network_diagram(parsed_data, vis_dir)
+                visualizer.plot_all_distributions(parsed_data, vis_dir)
+
+            # Save metrics as JSON
+            metrics_file = os.path.join(output_dir, 'diversity_metrics.json')
+            with open(metrics_file, 'w') as f:
+                json.dump(metrics, f, indent=2)
+
+            logger.info("Visualization generation complete")
+            return metrics
+
+        except Exception as e:
+            logger.error(f"Error during visualization generation: {str(e)}")
+            return {"error": str(e), "total_sequences": len(matched_sequences_all)}
 
 def generate_html_report(input_files, metrics, output_dir, report_path, logger):
     """Generate a comprehensive HTML report of the analysis"""
@@ -763,10 +909,14 @@ def generate_html_report(input_files, metrics, output_dir, report_path, logger):
         """
         
         for metric, value in metrics.items():
+            if isinstance(value, float):
+                value_formatted = f"{value:.4f}"
+            else:
+                value_formatted = str(value)
             html_content += f"""
                         <tr>
                             <td>{metric.replace('_', ' ').title()}</td>
-                            <td class="metric-value">{value:.4f if isinstance(value, float) else value}</td>
+                            <td class="metric-value">{value_formatted}</td>
                         </tr>
             """
         
@@ -776,16 +926,27 @@ def generate_html_report(input_files, metrics, output_dir, report_path, logger):
                 
                 <div class="section">
                     <h2>Visualizations</h2>
+
                     <div class="visualization">
-                        <h3>Taxonomic Distribution (Sunburst)</h3>
-                        <img src="visualizations/sunburst_plot.png" alt="Sunburst Plot" style="max-width: 100%;">
+                        <h3>Taxonomic Distribution up to Family Level (Sunburst)</h3>
+                        <img src="visualizations/sunburst_plot_family.png" alt="Sunburst Plot Family Level" style="max-width: 100%;">
                     </div>
-                    
+
+                    <div class="visualization">
+                        <h3>Taxonomic Distribution up to Genus Level (Sunburst)</h3>
+                        <img src="visualizations/sunburst_plot_genus.png" alt="Sunburst Plot Genus Level" style="max-width: 100%;">
+                    </div>
+
+                    <div class="visualization">
+                        <h3>Taxonomic Distribution up to Species Level (Sunburst)</h3>
+                        <img src="visualizations/sunburst_plot_species.png" alt="Sunburst Plot Species Level" style="max-width: 100%;">
+                    </div>
+
                     <div class="visualization">
                         <h3>Diversity Metrics Heatmap</h3>
                         <img src="visualizations/diversity_heatmap.png" alt="Diversity Heatmap" style="max-width: 100%;">
                     </div>
-                    
+
                     <div class="visualization">
                         <h3>Taxonomic Network</h3>
                         <img src="visualizations/taxonomy_network.png" alt="Taxonomic Network" style="max-width: 100%;">
@@ -1169,7 +1330,7 @@ if __name__ == "__main__":
             metrics = save_all_visualizations(
                 analyzer=analyzer,
                 visualizer=visualizer,
-                taxids=all_taxids,
+                matched_sequences_all=matched_sequences_all,
                 output_dir=args.output_folder,
                 logger=logger
             )
